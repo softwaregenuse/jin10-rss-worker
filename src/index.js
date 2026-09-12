@@ -27,13 +27,17 @@ const USER_AGENT =
   "AppleWebKit/537.36 (KHTML, like Gecko) " +
   "Chrome/151.0.0.0 Safari/537.36";
 
-const CACHE_KEY =
-  "https://cache.local/jin10-important.xml";
+const KV_RSS_KEY =
+  "jin10-important-rss";
+
+const KV_UPDATED_KEY =
+  "jin10-important-updated-at";
 
 
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
+    const url =
+      new URL(request.url);
 
     if (url.pathname === "/") {
       return new Response(
@@ -42,6 +46,9 @@ export default {
           "",
           "RSS:",
           `${url.origin}/jin10-important`,
+          "",
+          "Manual refresh:",
+          `${url.origin}/refresh`,
         ].join("\n"),
         {
           headers: {
@@ -53,26 +60,40 @@ export default {
     }
 
     if (
-      url.pathname === "/jin10-important"
+      url.pathname ===
+      "/jin10-important"
+    ) {
+      return serveCachedRSS(
+        env
+      );
+    }
+
+    if (
+      url.pathname ===
+      "/refresh"
     ) {
       try {
-        const rss =
-          await buildJin10ImportantRSS();
+        const result =
+          await refreshAndStoreRSS(
+            env
+          );
 
         return new Response(
-          rss,
+          [
+            "Refresh OK",
+            `Items: ${result.itemCount}`,
+            `Updated: ${result.updatedAt}`,
+          ].join("\n"),
           {
             headers: {
               "content-type":
-                "application/rss+xml; charset=utf-8",
-              "cache-control":
-                "public, max-age=300",
+                "text/plain; charset=utf-8",
             },
           }
         );
       } catch (error) {
         return new Response(
-          `RSS generation failed:\n${error.stack || error}`,
+          `Refresh failed:\n${error.stack || error}`,
           {
             status: 500,
             headers: {
@@ -92,16 +113,20 @@ export default {
     );
   },
 
+
   async scheduled(
     controller,
     env,
     ctx
   ) {
     ctx.waitUntil(
-      buildJin10ImportantRSS()
-        .then(() => {
+      refreshAndStoreRSS(
+        env
+      )
+        .then((result) => {
           console.log(
-            "Scheduled Jin10 refresh OK"
+            "Scheduled refresh OK",
+            result
           );
         })
         .catch((error) => {
@@ -115,20 +140,116 @@ export default {
 };
 
 
-async function buildJin10ImportantRSS() {
+async function serveCachedRSS(
+  env
+) {
+  const rss =
+    await env.RSS_CACHE.get(
+      KV_RSS_KEY
+    );
+
+  const updatedAt =
+    await env.RSS_CACHE.get(
+      KV_UPDATED_KEY
+    );
+
+  if (!rss) {
+    return new Response(
+      [
+        "RSS cache is empty.",
+        "",
+        "Please run /refresh once,",
+        "or wait for the next scheduled refresh.",
+      ].join("\n"),
+      {
+        status: 503,
+        headers: {
+          "content-type":
+            "text/plain; charset=utf-8",
+        },
+      }
+    );
+  }
+
+  return new Response(
+    rss,
+    {
+      headers: {
+        "content-type":
+          "application/rss+xml; charset=utf-8",
+
+        "cache-control":
+          "public, max-age=60",
+
+        "x-rss-updated-at":
+          updatedAt || "",
+      },
+    }
+  );
+}
+
+
+async function refreshAndStoreRSS(
+  env
+) {
+  const items =
+    await fetchJin10Items();
+
+  if (
+    !Array.isArray(items) ||
+    items.length === 0
+  ) {
+    throw new Error(
+      "No Jin10 items returned"
+    );
+  }
+
+  const rss =
+    generateRSS(
+      items
+    );
+
+  const updatedAt =
+    new Date().toISOString();
+
+  await env.RSS_CACHE.put(
+    KV_RSS_KEY,
+    rss
+  );
+
+  await env.RSS_CACHE.put(
+    KV_UPDATED_KEY,
+    updatedAt
+  );
+
+  return {
+    itemCount:
+      items.length,
+
+    updatedAt,
+  };
+}
+
+
+async function fetchJin10Items() {
   const cookieJar = [];
 
   const pageResponse =
-    await fetch(PAGE_URL, {
-      headers: {
-        "User-Agent":
-          USER_AGENT,
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language":
-          "zh-CN,zh;q=0.9,en;q=0.8",
-      },
-    });
+    await fetch(
+      PAGE_URL,
+      {
+        headers: {
+          "User-Agent":
+            USER_AGENT,
+
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+
+          "Accept-Language":
+            "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+      }
+    );
 
   if (!pageResponse.ok) {
     throw new Error(
@@ -180,17 +301,19 @@ async function buildJin10ImportantRSS() {
     );
   }
 
-  let lastError = null;
+  let lastError =
+    null;
 
   for (
-    const host of apiHosts
+    const host
+    of apiHosts
   ) {
     const apiURL =
       `https://${host}${API_PATH}`;
 
     try {
       console.log(
-        "Trying:",
+        "Trying Jin10 API:",
         apiURL
       );
 
@@ -210,11 +333,14 @@ async function buildJin10ImportantRSS() {
         response.status
       );
 
-      if (!response.ok) {
+      if (
+        !response.ok
+      ) {
         lastError =
           new Error(
             `HTTP ${response.status}`
           );
+
         continue;
       }
 
@@ -226,30 +352,42 @@ async function buildJin10ImportantRSS() {
       ) {
         lastError =
           new Error(
-            `API status ${payload.status}`
+            `Jin10 API status ${payload.status}`
           );
+
         continue;
       }
 
+      const data =
+        payload.data;
+
       if (
-        !Array.isArray(
-          payload.data
-        ) ||
-        payload.data.length === 0
+        !Array.isArray(data) ||
+        data.length === 0
       ) {
         lastError =
           new Error(
-            "API returned no items"
+            "Jin10 API returned no items"
           );
+
         continue;
       }
 
-      return generateRSS(
-        payload.data
+      console.log(
+        `Jin10 API OK: ${data.length} items`
       );
+
+      return data;
+
     } catch (error) {
       lastError =
         error;
+
+      console.error(
+        "API host failed:",
+        host,
+        error
+      );
     }
   }
 
@@ -268,18 +406,25 @@ function buildHeaders(
   const headers = {
     Accept:
       "*/*",
+
     "Accept-Language":
       "zh-CN,zh;q=0.9,en;q=0.8",
+
     "Content-Type":
       "application/json",
+
     Origin:
       PAGE_ORIGIN,
+
     Referer:
       PAGE_REFERER,
+
     "User-Agent":
       USER_AGENT,
+
     "x-app-id":
       X_APP_ID,
+
     "x-version":
       X_VERSION,
   };
@@ -317,7 +462,8 @@ function collectCookies(
     const part of parts
   ) {
     const cookie =
-      part.split(";")[0]
+      part
+        .split(";")[0]
         .trim();
 
     if (!cookie) {
@@ -329,13 +475,15 @@ function collectCookies(
 
     const index =
       cookieJar.findIndex(
-        item =>
+        (item) =>
           item.startsWith(
             `${name}=`
           )
       );
 
-    if (index >= 0) {
+    if (
+      index >= 0
+    ) {
       cookieJar[index] =
         cookie;
     } else {
@@ -379,7 +527,8 @@ async function discoverAPIHosts(
   }
 
   for (
-    const src of scripts
+    const src
+    of scripts
   ) {
     try {
       const jsURL =
@@ -395,13 +544,16 @@ async function discoverAPIHosts(
             headers: {
               "User-Agent":
                 USER_AGENT,
+
               Referer:
                 PAGE_URL,
             },
           }
         );
 
-      if (!response.ok) {
+      if (
+        !response.ok
+      ) {
         continue;
       }
 
@@ -412,6 +564,7 @@ async function discoverAPIHosts(
         text,
         hosts
       );
+
     } catch (_) {
       // ignore
     }
@@ -453,7 +606,8 @@ function generateRSS(
   const rssItems = [];
 
   for (
-    const wrapper of items
+    const wrapper
+    of items
   ) {
     const itemId =
       String(
@@ -514,7 +668,7 @@ function generateRSS(
     rssItems.length === 0
   ) {
     throw new Error(
-      "No valid RSS items"
+      "No valid RSS items generated"
     );
   }
 
@@ -525,7 +679,7 @@ function generateRSS(
   <link>${escapeXML(PAGE_URL)}</link>
   <description>金十数据重要事件 RSS</description>
   <language>zh-cn</language>
-  <generator>Cloudflare Worker</generator>
+  <generator>Cloudflare Worker + KV</generator>
   <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>
   ${rssItems.join("\n")}
 </channel>
@@ -570,8 +724,10 @@ function extractTitle(
     clean.length > 60
   ) {
     return (
-      clean.slice(0, 60) +
-      "…"
+      clean.slice(
+        0,
+        60
+      ) + "…"
     );
   }
 
@@ -602,7 +758,9 @@ function chooseLink(
       ""
     ).trim();
 
-  if (sourceLink) {
+  if (
+    sourceLink
+  ) {
     return sourceLink;
   }
 
@@ -655,6 +813,18 @@ function buildDescription(
     );
   }
 
+  const tag =
+    String(
+      inner?.tag ||
+      ""
+    ).trim();
+
+  if (tag) {
+    parts.push(
+      `<p>分类：${escapeHTML(tag)}</p>`
+    );
+  }
+
   const remarks =
     Array.isArray(
       outer?.remark
@@ -665,7 +835,8 @@ function buildDescription(
   const remarkItems = [];
 
   for (
-    const remark of remarks
+    const remark
+    of remarks
   ) {
     if (
       !remark ||
@@ -702,12 +873,15 @@ function buildDescription(
     ) {
       text =
         `<a href="${escapeHTML(link)}">${escapeHTML(title)}</a>`;
+
     } else if (title) {
       text =
         escapeHTML(title);
     }
 
-    if (content) {
+    if (
+      content
+    ) {
       if (text) {
         text += "：";
       }
