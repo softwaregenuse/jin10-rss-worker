@@ -1,0 +1,6 @@
+name = "jin10-rss-worker"
+main = "src/index.js"
+compatibility_date = "2026-09-12"
+
+[triggers]
+crons = ["*/30 * * * *"]
