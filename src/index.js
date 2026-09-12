@@ -27,18 +27,29 @@ const USER_AGENT =
   "AppleWebKit/537.36 (KHTML, like Gecko) " +
   "Chrome/151.0.0.0 Safari/537.36";
 
+
 const KV_RSS_KEY =
   "jin10-important-rss";
 
 const KV_UPDATED_KEY =
   "jin10-important-updated-at";
 
+const KV_COUNT_KEY =
+  "jin10-important-item-count";
+
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url =
       new URL(request.url);
 
+
+    /*
+     * 根目录
+     *
+     * 不访问金十
+     * 不读取 RSS
+     */
     if (url.pathname === "/") {
       return new Response(
         [
@@ -46,6 +57,9 @@ export default {
           "",
           "RSS:",
           `${url.origin}/jin10-important`,
+          "",
+          "Status:",
+          `${url.origin}/status`,
           "",
           "Manual refresh:",
           `${url.origin}/refresh`,
@@ -59,22 +73,57 @@ export default {
       );
     }
 
+
+    /*
+     * RSS
+     *
+     * 非常重要：
+     *
+     * 这里只允许读取 KV。
+     *
+     * 绝对不：
+     * - fetch 金十
+     * - 初始化 Cookie
+     * - 查找 API Host
+     * - 调用 refresh
+     */
     if (
       url.pathname ===
       "/jin10-important"
     ) {
-      return serveCachedRSS(
+      return serveRSSFromKV(
         env
       );
     }
 
+
+    /*
+     * 状态页面
+     *
+     * 也只读取 KV。
+     */
+    if (
+      url.pathname ===
+      "/status"
+    ) {
+      return serveStatus(
+        env
+      );
+    }
+
+
+    /*
+     * 手动刷新
+     *
+     * 只有这里才访问金十。
+     */
     if (
       url.pathname ===
       "/refresh"
     ) {
       try {
         const result =
-          await refreshAndStoreRSS(
+          await refreshRSS(
             env
           );
 
@@ -88,22 +137,38 @@ export default {
             headers: {
               "content-type":
                 "text/plain; charset=utf-8",
+
+              "cache-control":
+                "no-store",
             },
           }
         );
+
       } catch (error) {
         return new Response(
-          `Refresh failed:\n${error.stack || error}`,
+          [
+            "Refresh failed",
+            "",
+            String(
+              error?.stack ||
+              error
+            ),
+          ].join("\n"),
           {
             status: 500,
+
             headers: {
               "content-type":
                 "text/plain; charset=utf-8",
+
+              "cache-control":
+                "no-store",
             },
           }
         );
       }
     }
+
 
     return new Response(
       "Not Found",
@@ -114,55 +179,150 @@ export default {
   },
 
 
+  /*
+   * Cloudflare Cron
+   *
+   * 每 30 分钟执行。
+   *
+   * 抓取成功：
+   *   覆盖 KV
+   *
+   * 抓取失败：
+   *   原来的 RSS 保持不变
+   */
   async scheduled(
     controller,
     env,
     ctx
   ) {
     ctx.waitUntil(
-      refreshAndStoreRSS(
+      refreshRSS(
         env
       )
-        .then((result) => {
-          console.log(
-            "Scheduled refresh OK",
-            result
-          );
-        })
-        .catch((error) => {
-          console.error(
-            "Scheduled refresh failed",
-            error
-          );
-        })
+        .then(
+          (result) => {
+            console.log(
+              "Scheduled refresh OK:",
+              result
+            );
+          }
+        )
+        .catch(
+          (error) => {
+            console.error(
+              "Scheduled refresh failed:",
+              error
+            );
+          }
+        )
     );
   },
 };
 
 
-async function serveCachedRSS(
+/*
+ * =========================================================
+ * RSS 请求
+ * =========================================================
+ *
+ * 这里只进行一次 KV GET。
+ *
+ * 不允许访问任何外部网站。
+ */
+async function serveRSSFromKV(
   env
 ) {
+  if (
+    !env.RSS_CACHE
+  ) {
+    return new Response(
+      "RSS_CACHE binding is missing.",
+      {
+        status: 500,
+
+        headers: {
+          "content-type":
+            "text/plain; charset=utf-8",
+
+          "cache-control":
+            "no-store",
+        },
+      }
+    );
+  }
+
+
   const rss =
     await env.RSS_CACHE.get(
       KV_RSS_KEY
     );
 
-  const updatedAt =
-    await env.RSS_CACHE.get(
-      KV_UPDATED_KEY
-    );
 
   if (!rss) {
     return new Response(
       [
         "RSS cache is empty.",
         "",
-        "Please run /refresh once,",
-        "or wait for the next scheduled refresh.",
+        "Open /refresh once first.",
       ].join("\n"),
       {
         status: 503,
+
+        headers: {
+          "content-type":
+            "text/plain; charset=utf-8",
+
+          "cache-control":
+            "no-store",
+        },
+      }
+    );
+  }
+
+
+  return new Response(
+    rss,
+    {
+      status: 200,
+
+      headers: {
+        "content-type":
+          "application/rss+xml; charset=utf-8",
+
+        /*
+         * FreshRSS 可以直接取。
+         *
+         * Cloudflare 边缘节点也允许短时间缓存。
+         */
+        "cache-control":
+          "public, max-age=60",
+
+        "x-rss-source":
+          "cloudflare-kv",
+      },
+    }
+  );
+}
+
+
+/*
+ * =========================================================
+ * 状态
+ * =========================================================
+ *
+ * 同样只读取 KV。
+ */
+async function serveStatus(
+  env
+) {
+  if (
+    !env.RSS_CACHE
+  ) {
+    return new Response(
+      "RSS_CACHE binding is missing.",
+      {
+        status: 500,
+
         headers: {
           "content-type":
             "text/plain; charset=utf-8",
@@ -171,56 +331,117 @@ async function serveCachedRSS(
     );
   }
 
+
+  const [
+    updatedAt,
+    itemCount,
+  ] =
+    await Promise.all([
+      env.RSS_CACHE.get(
+        KV_UPDATED_KEY
+      ),
+
+      env.RSS_CACHE.get(
+        KV_COUNT_KEY
+      ),
+    ]);
+
+
   return new Response(
-    rss,
+    [
+      "Jin10 RSS cache status",
+      "",
+      `Updated: ${updatedAt || "never"}`,
+      `Items: ${itemCount || "0"}`,
+    ].join("\n"),
     {
       headers: {
         "content-type":
-          "application/rss+xml; charset=utf-8",
+          "text/plain; charset=utf-8",
 
         "cache-control":
-          "public, max-age=60",
-
-        "x-rss-updated-at":
-          updatedAt || "",
+          "no-store",
       },
     }
   );
 }
 
 
-async function refreshAndStoreRSS(
+/*
+ * =========================================================
+ * 刷新
+ * =========================================================
+ *
+ * 这里才真正访问金十。
+ */
+async function refreshRSS(
   env
 ) {
+  if (
+    !env.RSS_CACHE
+  ) {
+    throw new Error(
+      "RSS_CACHE binding is missing"
+    );
+  }
+
+
+  /*
+   * 先完整抓取。
+   *
+   * 抓取失败时不会写 KV，
+   * 因此旧 RSS 会继续保留。
+   */
   const items =
     await fetchJin10Items();
+
 
   if (
     !Array.isArray(items) ||
     items.length === 0
   ) {
     throw new Error(
-      "No Jin10 items returned"
+      "Jin10 returned no items"
     );
   }
+
 
   const rss =
     generateRSS(
       items
     );
 
+
   const updatedAt =
     new Date().toISOString();
 
+
+  /*
+   * RSS 最后写。
+   *
+   * 即使前面的网络请求失败，
+   * 旧 RSS 也不会被清空。
+   */
   await env.RSS_CACHE.put(
     KV_RSS_KEY,
     rss
   );
 
-  await env.RSS_CACHE.put(
-    KV_UPDATED_KEY,
-    updatedAt
-  );
+
+  await Promise.all([
+    env.RSS_CACHE.put(
+      KV_UPDATED_KEY,
+      updatedAt
+    ),
+
+    env.RSS_CACHE.put(
+      KV_COUNT_KEY,
+      String(
+        items.length
+      )
+    ),
+  ]);
+
 
   return {
     itemCount:
@@ -231,9 +452,19 @@ async function refreshAndStoreRSS(
 }
 
 
+/*
+ * =========================================================
+ * 金十抓取
+ * =========================================================
+ */
 async function fetchJin10Items() {
   const cookieJar = [];
 
+
+  /*
+   * 1.
+   * 打开重要事件页面。
+   */
   const pageResponse =
     await fetch(
       PAGE_URL,
@@ -242,7 +473,7 @@ async function fetchJin10Items() {
           "User-Agent":
             USER_AGENT,
 
-          Accept:
+          "Accept":
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 
           "Accept-Language":
@@ -251,145 +482,206 @@ async function fetchJin10Items() {
       }
     );
 
-  if (!pageResponse.ok) {
+
+  if (
+    !pageResponse.ok
+  ) {
     throw new Error(
       `Page HTTP ${pageResponse.status}`
     );
   }
 
-  const pageHTML =
-    await pageResponse.text();
 
   collectCookies(
     pageResponse,
     cookieJar
   );
 
+
+  const pageHTML =
+    await pageResponse.text();
+
+
+  /*
+   * 2.
+   * 请求 userinfo。
+   *
+   * 金十会在这里建立会话 / Cookie。
+   */
   const userInfoResponse =
     await fetch(
       USERINFO_URL,
       {
         headers:
-          buildHeaders(
+          buildAPIHeaders(
             cookieJar
           ),
       }
     );
+
 
   collectCookies(
     userInfoResponse,
     cookieJar
   );
 
+
   console.log(
-    "Userinfo status:",
+    "Userinfo:",
     userInfoResponse.status
   );
 
-  const apiHosts =
+
+  /*
+   * 3.
+   * 从页面 JS 中寻找当前 API Host。
+   */
+  const hosts =
     await discoverAPIHosts(
       pageHTML
     );
 
+
+  /*
+   * 加入备用地址。
+   */
   if (
-    !apiHosts.includes(
+    !hosts.includes(
       FALLBACK_API_HOST
     )
   ) {
-    apiHosts.push(
+    hosts.push(
       FALLBACK_API_HOST
     );
   }
 
+
+  if (
+    hosts.length === 0
+  ) {
+    throw new Error(
+      "No Jin10 API host found"
+    );
+  }
+
+
   let lastError =
     null;
 
+
+  /*
+   * 4.
+   * 挨个尝试 API Host。
+   */
   for (
     const host
-    of apiHosts
+    of hosts
   ) {
     const apiURL =
       `https://${host}${API_PATH}`;
 
+
     try {
       console.log(
-        "Trying Jin10 API:",
+        "Trying API:",
         apiURL
       );
+
 
       const response =
         await fetch(
           apiURL,
           {
             headers:
-              buildHeaders(
+              buildAPIHeaders(
                 cookieJar
               ),
           }
         );
 
+
       console.log(
-        "API status:",
+        "API HTTP:",
         response.status
       );
+
 
       if (
         !response.ok
       ) {
         lastError =
           new Error(
-            `HTTP ${response.status}`
+            `API HTTP ${response.status}`
           );
 
         continue;
       }
+
 
       const payload =
         await response.json();
 
+
       if (
-        payload.status !== 200
+        payload?.status !== 200
       ) {
         lastError =
           new Error(
-            `Jin10 API status ${payload.status}`
+            `API status ${payload?.status}`
           );
 
         continue;
       }
 
-      const data =
-        payload.data;
 
       if (
-        !Array.isArray(data) ||
-        data.length === 0
+        !Array.isArray(
+          payload?.data
+        )
       ) {
         lastError =
           new Error(
-            "Jin10 API returned no items"
+            "Invalid API data"
           );
 
         continue;
       }
+
+
+      if (
+        payload.data.length === 0
+      ) {
+        lastError =
+          new Error(
+            "API returned zero items"
+          );
+
+        continue;
+      }
+
 
       console.log(
-        `Jin10 API OK: ${data.length} items`
+        "API OK:",
+        payload.data.length,
+        "items"
       );
 
-      return data;
+
+      return payload.data;
 
     } catch (error) {
       lastError =
         error;
 
+
       console.error(
-        "API host failed:",
+        "API failed:",
         host,
         error
       );
     }
   }
+
 
   throw (
     lastError ||
@@ -400,11 +692,16 @@ async function fetchJin10Items() {
 }
 
 
-function buildHeaders(
+/*
+ * =========================================================
+ * 请求头
+ * =========================================================
+ */
+function buildAPIHeaders(
   cookieJar
 ) {
   const headers = {
-    Accept:
+    "Accept":
       "*/*",
 
     "Accept-Language":
@@ -413,10 +710,10 @@ function buildHeaders(
     "Content-Type":
       "application/json",
 
-    Origin:
+    "Origin":
       PAGE_ORIGIN,
 
-    Referer:
+    "Referer":
       PAGE_REFERER,
 
     "User-Agent":
@@ -429,51 +726,100 @@ function buildHeaders(
       X_VERSION,
   };
 
+
   if (
-    cookieJar.length
+    cookieJar.length > 0
   ) {
     headers.Cookie =
-      cookieJar.join("; ");
+      cookieJar.join(
+        "; "
+      );
   }
+
 
   return headers;
 }
 
 
+/*
+ * =========================================================
+ * Cookie
+ * =========================================================
+ */
 function collectCookies(
   response,
   cookieJar
 ) {
-  const raw =
-    response.headers.get(
-      "set-cookie"
-    );
+  let values = [];
 
-  if (!raw) {
-    return;
+
+  /*
+   * Cloudflare Workers 支持 getSetCookie() 时优先使用。
+   */
+  if (
+    typeof response.headers.getSetCookie ===
+    "function"
+  ) {
+    values =
+      response.headers.getSetCookie();
   }
 
-  const parts =
-    raw.split(
-      /,(?=[^;,]+=)/
-    );
+
+  /*
+   * 兼容普通 get("set-cookie")。
+   */
+  if (
+    values.length === 0
+  ) {
+    const raw =
+      response.headers.get(
+        "set-cookie"
+      );
+
+
+    if (raw) {
+      values =
+        raw.split(
+          /,(?=[^;,]+=)/
+        );
+    }
+  }
+
 
   for (
-    const part of parts
+    const rawCookie
+    of values
   ) {
     const cookie =
-      part
+      String(rawCookie)
         .split(";")[0]
         .trim();
+
 
     if (!cookie) {
       continue;
     }
 
-    const name =
-      cookie.split("=")[0];
 
-    const index =
+    const eq =
+      cookie.indexOf("=");
+
+
+    if (
+      eq <= 0
+    ) {
+      continue;
+    }
+
+
+    const name =
+      cookie.slice(
+        0,
+        eq
+      );
+
+
+    const oldIndex =
       cookieJar.findIndex(
         (item) =>
           item.startsWith(
@@ -481,11 +827,14 @@ function collectCookies(
           )
       );
 
+
     if (
-      index >= 0
+      oldIndex >= 0
     ) {
-      cookieJar[index] =
-        cookie;
+      cookieJar[
+        oldIndex
+      ] = cookie;
+
     } else {
       cookieJar.push(
         cookie
@@ -495,23 +844,32 @@ function collectCookies(
 }
 
 
+/*
+ * =========================================================
+ * API Host 自动发现
+ * =========================================================
+ */
 async function discoverAPIHosts(
   pageHTML
 ) {
   const hosts =
     new Set();
 
+
   addHosts(
     pageHTML,
     hosts
   );
 
+
   const scriptRegex =
     /<script[^>]+src=["']([^"']+)["']/gi;
+
 
   const scripts = [];
 
   let match;
+
 
   while (
     (
@@ -526,9 +884,17 @@ async function discoverAPIHosts(
     );
   }
 
+
+  /*
+   * 防止页面以后引用很多 JS，
+   * 最多检查前 15 个。
+   */
   for (
     const src
-    of scripts
+    of scripts.slice(
+      0,
+      15
+    )
   ) {
     try {
       const jsURL =
@@ -536,6 +902,7 @@ async function discoverAPIHosts(
           src,
           PAGE_URL
         ).href;
+
 
       const response =
         await fetch(
@@ -545,11 +912,12 @@ async function discoverAPIHosts(
               "User-Agent":
                 USER_AGENT,
 
-              Referer:
+              "Referer":
                 PAGE_URL,
             },
           }
         );
+
 
       if (
         !response.ok
@@ -557,18 +925,23 @@ async function discoverAPIHosts(
         continue;
       }
 
+
       const text =
         await response.text();
+
 
       addHosts(
         text,
         hosts
       );
 
-    } catch (_) {
-      // ignore
+    } catch {
+      /*
+       * 某个 JS 失败不影响其他 JS。
+       */
     }
   }
+
 
   return [
     ...hosts,
@@ -583,13 +956,17 @@ function addHosts(
   const regex =
     /([a-zA-Z0-9]+\.z3c\.jin10\.com)/g;
 
+
   let match;
+
 
   while (
     (
       match =
         regex.exec(
-          text || ""
+          String(
+            text || ""
+          )
         )
     ) !== null
   ) {
@@ -600,32 +977,51 @@ function addHosts(
 }
 
 
+/*
+ * =========================================================
+ * RSS
+ * =========================================================
+ */
 function generateRSS(
   items
 ) {
   const rssItems = [];
 
+
   for (
     const wrapper
     of items
   ) {
+    if (
+      !wrapper ||
+      typeof wrapper !==
+        "object"
+    ) {
+      continue;
+    }
+
+
     const itemId =
       String(
-        wrapper?.item_id ||
+        wrapper.item_id ||
         ""
       ).trim();
 
+
     const outer =
-      wrapper?.data || {};
+      wrapper.data || {};
+
 
     const inner =
-      outer?.data || {};
+      outer.data || {};
+
 
     const content =
       String(
-        inner?.content ||
+        inner.content ||
         ""
       ).trim();
+
 
     const title =
       extractTitle(
@@ -633,16 +1029,24 @@ function generateRSS(
         content
       );
 
+
+    if (!title) {
+      continue;
+    }
+
+
     const link =
       chooseLink(
         itemId,
         inner
       );
 
+
     const pubDate =
       parsePubDate(
-        outer?.time
+        outer.time
       );
+
 
     const description =
       buildDescription(
@@ -650,19 +1054,18 @@ function generateRSS(
         outer
       );
 
-    if (!title) {
-      continue;
-    }
 
-    rssItems.push(`
-<item>
-  <title>${escapeXML(title)}</title>
-  <link>${escapeXML(link)}</link>
-  <guid isPermaLink="false">${escapeXML(itemId || link)}</guid>
-  <pubDate>${escapeXML(pubDate)}</pubDate>
-  <description><![CDATA[${description}]]></description>
-</item>`);
+    rssItems.push(
+`<item>
+<title>${escapeXML(title)}</title>
+<link>${escapeXML(link)}</link>
+<guid isPermaLink="false">${escapeXML(itemId || link)}</guid>
+<pubDate>${escapeXML(pubDate)}</pubDate>
+<description><![CDATA[${description}]]></description>
+</item>`
+    );
   }
+
 
   if (
     rssItems.length === 0
@@ -672,21 +1075,29 @@ function generateRSS(
     );
   }
 
-  return `<?xml version="1.0" encoding="UTF-8"?>
+
+  return (
+`<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
 <channel>
-  <title>金十数据 - 重要事件</title>
-  <link>${escapeXML(PAGE_URL)}</link>
-  <description>金十数据重要事件 RSS</description>
-  <language>zh-cn</language>
-  <generator>Cloudflare Worker + KV</generator>
-  <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>
-  ${rssItems.join("\n")}
+<title>金十数据 - 重要事件</title>
+<link>${escapeXML(PAGE_URL)}</link>
+<description>金十数据重要事件 RSS</description>
+<language>zh-cn</language>
+<generator>Cloudflare Worker KV Cache</generator>
+<lastBuildDate>${new Date().toUTCString()}</lastBuildDate>
+${rssItems.join("\n")}
 </channel>
-</rss>`;
+</rss>`
+  );
 }
 
 
+/*
+ * =========================================================
+ * 标题
+ * =========================================================
+ */
 function extractTitle(
   inner,
   content
@@ -697,20 +1108,24 @@ function extractTitle(
       ""
     ).trim();
 
+
   if (title) {
     return title;
   }
+
 
   const match =
     content.match(
       /^【([^】]+)】/
     );
 
+
   if (match) {
     return (
       match[1].trim()
     );
   }
+
 
   const clean =
     content
@@ -720,6 +1135,7 @@ function extractTitle(
       )
       .trim();
 
+
   if (
     clean.length > 60
   ) {
@@ -727,9 +1143,11 @@ function extractTitle(
       clean.slice(
         0,
         60
-      ) + "…"
+      ) +
+      "…"
     );
   }
+
 
   return (
     clean ||
@@ -738,6 +1156,11 @@ function extractTitle(
 }
 
 
+/*
+ * =========================================================
+ * 链接
+ * =========================================================
+ */
 function chooseLink(
   itemId,
   inner
@@ -748,9 +1171,11 @@ function chooseLink(
       ""
     ).trim();
 
+
   if (link) {
     return link;
   }
+
 
   const sourceLink =
     String(
@@ -758,11 +1183,13 @@ function chooseLink(
       ""
     ).trim();
 
+
   if (
     sourceLink
   ) {
     return sourceLink;
   }
+
 
   return (
     "https://flash.jin10.com/detail/" +
@@ -771,11 +1198,17 @@ function chooseLink(
 }
 
 
+/*
+ * =========================================================
+ * 正文
+ * =========================================================
+ */
 function buildDescription(
   inner,
   outer
 ) {
   const parts = [];
+
 
   const pic =
     String(
@@ -783,11 +1216,13 @@ function buildDescription(
       ""
     ).trim();
 
+
   if (pic) {
     parts.push(
       `<p><img src="${escapeHTML(pic)}" style="max-width:100%;height:auto;" /></p>`
     );
   }
+
 
   const content =
     String(
@@ -795,11 +1230,13 @@ function buildDescription(
       ""
     ).trim();
 
+
   if (content) {
     parts.push(
       `<p>${escapeHTML(content)}</p>`
     );
   }
+
 
   const source =
     String(
@@ -807,11 +1244,13 @@ function buildDescription(
       ""
     ).trim();
 
+
   if (source) {
     parts.push(
       `<p>来源：${escapeHTML(source)}</p>`
     );
   }
+
 
   const tag =
     String(
@@ -819,11 +1258,13 @@ function buildDescription(
       ""
     ).trim();
 
+
   if (tag) {
     parts.push(
       `<p>分类：${escapeHTML(tag)}</p>`
     );
   }
+
 
   const remarks =
     Array.isArray(
@@ -832,7 +1273,9 @@ function buildDescription(
       ? outer.remark
       : [];
 
+
   const remarkItems = [];
+
 
   for (
     const remark
@@ -846,49 +1289,61 @@ function buildDescription(
       continue;
     }
 
+
     const title =
       String(
         remark.title ||
         ""
       ).trim();
 
-    const content =
+
+    const remarkContent =
       String(
         remark.content ||
         ""
       ).trim();
 
-    const link =
+
+    const remarkLink =
       String(
         remark.link ||
         remark.url ||
         ""
       ).trim();
 
+
     let text = "";
 
+
     if (
-      link &&
+      remarkLink &&
       title
     ) {
       text =
-        `<a href="${escapeHTML(link)}">${escapeHTML(title)}</a>`;
+        `<a href="${escapeHTML(remarkLink)}">${escapeHTML(title)}</a>`;
 
     } else if (title) {
       text =
-        escapeHTML(title);
+        escapeHTML(
+          title
+        );
     }
 
+
     if (
-      content
+      remarkContent
     ) {
       if (text) {
         text += "：";
       }
 
+
       text +=
-        escapeHTML(content);
+        escapeHTML(
+          remarkContent
+        );
     }
+
 
     if (text) {
       remarkItems.push(
@@ -897,18 +1352,25 @@ function buildDescription(
     }
   }
 
+
   if (
-    remarkItems.length
+    remarkItems.length > 0
   ) {
     parts.push(
       `<p><strong>相关信息</strong></p><ul>${remarkItems.join("")}</ul>`
     );
   }
 
+
   return parts.join("");
 }
 
 
+/*
+ * =========================================================
+ * 北京时间 -> RFC822
+ * =========================================================
+ */
 function parsePubDate(
   value
 ) {
@@ -916,14 +1378,17 @@ function parsePubDate(
     return "";
   }
 
+
   const match =
     String(value).match(
       /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/
     );
 
+
   if (!match) {
     return "";
   }
+
 
   const [
     ,
@@ -935,6 +1400,7 @@ function parsePubDate(
     second,
   ] = match;
 
+
   const utc =
     Date.UTC(
       Number(year),
@@ -945,12 +1411,18 @@ function parsePubDate(
       Number(second)
     );
 
+
   return new Date(
     utc
   ).toUTCString();
 }
 
 
+/*
+ * =========================================================
+ * XML 转义
+ * =========================================================
+ */
 function escapeXML(
   value
 ) {
@@ -980,6 +1452,11 @@ function escapeXML(
 }
 
 
+/*
+ * =========================================================
+ * HTML 转义
+ * =========================================================
+ */
 function escapeHTML(
   value
 ) {
